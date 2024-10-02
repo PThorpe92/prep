@@ -44,29 +44,23 @@ func (cmpm *ComptimeModifier) Modify(f *dst.File, dec *decorator.Decorator, res 
 	funcs := Merge(existingFuncs, newFuncs)
 	Dump(funcs, FuncsPath)
 
-	newVars := collectVars(f)
-	existingVars := Restore(VarsPath)
-	vars := Merge(existingVars, newVars)
-	Dump(vars, VarsPath)
+	globalScope := collectVars(f)
+	currentScope := globalScope
 
-	var parentFunc string
 	dstutil.Apply(f, func(c *dstutil.Cursor) bool {
-		funcDecl, ok := c.Node().(*dst.FuncDecl)
-		if ok {
-			parentFunc = funcDecl.Name.Name
+		switch c.Node().(type) {
+		case *dst.FuncDecl:
+			currentScope = &Scope{vars: make(map[string]string), parent: currentScope}
+		case *dst.BlockStmt:
+			currentScope = &Scope{vars: make(map[string]string), parent: currentScope}
 		}
-
 		callExpr, ok := c.Node().(*dst.CallExpr)
 		if !ok {
 			return true
 		}
 
 		funcIdent, isIdent := callExpr.Fun.(*dst.Ident)
-		if !isIdent {
-			return true
-		}
-
-		if funcIdent.Path != PrepPath && funcIdent.Name != ComptimeName {
+		if !isIdent || funcIdent.Name != ComptimeName || funcIdent.Path != PrepPath {
 			return true
 		}
 
@@ -82,52 +76,37 @@ func (cmpm *ComptimeModifier) Modify(f *dst.File, dec *decorator.Decorator, res 
 
 		funcToCall := funcToCallIdent.Name
 
-		origArgs := make([]string, len(argExpr.Args))
 		args := make([]string, len(argExpr.Args))
-		identName := ""
-
 		for idx, arg := range argExpr.Args {
 			switch expr := arg.(type) {
 			case *dst.Ident:
-				scopedName := fmt.Sprintf("%s_%s", parentFunc, expr.Name)
-				v, ok := vars[scopedName]
-				if !ok {
-					origArgs[idx] = expr.Name
-					identName = expr.Name
-
-					continue
+				value, found := lookupVariable(expr.Name, currentScope)
+				if !found {
+					panic(fmt.Sprintf("cannot find variable '%s' in scope", expr.Name))
 				}
-
-				args[idx] = v
-			case *dst.BasicLit:
-				value := expr.Value
 				args[idx] = value
-				origArgs[idx] = value
+			case *dst.BasicLit:
+				args[idx] = expr.Value
+			default:
+				panic(fmt.Sprintf("cannot use '%T' as argument to function call at comptime", expr))
 			}
 		}
 		argsStr := strings.Join(args, ", ")
-		origArgsStr := strings.Join(origArgs, ", ")
-
-		if identName != "" {
-			errStr := "unable to resolve comptime value '%s' in function call '%s(%s)'\n" +
-				"argument to function being called at comptime must be comptime-known or represent a basic literal\n"
-			panic(fmt.Sprintf(errStr, identName, funcToCall, origArgsStr))
-		}
 
 		fn, ok := funcs[funcToCall]
 		if !ok {
-			panic(fmt.Sprintf("cannot find func '%s' to eval", funcToCall))
+			panic(fmt.Sprintf("Function '%s' not found", funcToCall))
 		}
 
 		_, err := cmpm.intr.Eval(fn)
 		if err != nil {
-			panic(fmt.Sprintf("cannot eval: %s", err))
+			panic(fmt.Sprintf("Cannot evaluate function '%s': %v", funcToCall, err))
 		}
 
 		call := fmt.Sprintf("%s%s.%s(%v)", PrepPrefix, funcToCall, funcToCall, argsStr)
 		res, err := cmpm.intr.Eval(call)
 		if err != nil {
-			panic(fmt.Sprintf("cannot call: %s", err))
+			panic(fmt.Sprintf("Cannot call function '%s': %v", funcToCall, err))
 		}
 
 		typeName := strings.ToUpper(res.Type().Name())
@@ -136,14 +115,32 @@ func (cmpm *ComptimeModifier) Modify(f *dst.File, dec *decorator.Decorator, res 
 		}
 
 		tokenValue := token.Lookup(typeName)
-		lit := &dst.BasicLit{Kind: tokenValue, Value: fmt.Sprintf("%q", res.Interface())}
+		lit := &dst.BasicLit{
+			Kind:  tokenValue,
+			Value: fmt.Sprintf("%q", res.Interface()),
+		}
 
 		c.Replace(lit)
 
 		return true
-	}, nil)
+	}, func(c *dstutil.Cursor) bool {
+		switch c.Node().(type) {
+		case *dst.FuncDecl, *dst.BlockStmt:
+			currentScope = currentScope.parent
+		}
+		return true
+	})
 
 	return f
+}
+
+func lookupVariable(name string, scope *Scope) (string, bool) {
+	for s := scope; s != nil; s = s.parent {
+		if val, ok := s.vars[name]; ok {
+			return val, true
+		}
+	}
+	return "", false
 }
 
 func collectFuncs(f *dst.File, res *decorator.Restorer) map[string]string {
@@ -173,44 +170,56 @@ func collectFuncs(f *dst.File, res *decorator.Restorer) map[string]string {
 	return funcs
 }
 
-func collectVars(f *dst.File) map[string]string {
-	vars := make(map[string]string)
-	var parentFunc string
+type Scope struct {
+	parent *Scope
+	vars   map[string]string
+}
+
+func collectVars(f *dst.File) *Scope {
+	global := &Scope{vars: make(map[string]string)}
+	current := global
 
 	dstutil.Apply(f, func(c *dstutil.Cursor) bool {
-		funcDecl, ok := c.Node().(*dst.FuncDecl)
-		if ok {
-			parentFunc = funcDecl.Name.Name
+		switch node := c.Node().(type) {
+		case *dst.FuncDecl:
+			current = &Scope{parent: current, vars: make(map[string]string)}
+		case *dst.BlockStmt:
+			current = &Scope{parent: current, vars: make(map[string]string)}
+		case *dst.AssignStmt:
+			handleAssignment(node, current)
 		}
-
-		assignStmt, ok := c.Node().(*dst.AssignStmt)
-		if !ok {
-			return true
-		}
-
-		for idx, lhs := range assignStmt.Lhs {
-			ident, ok := lhs.(*dst.Ident)
-			if !ok {
-				continue
-			}
-
-			if len(assignStmt.Lhs) != len(assignStmt.Rhs) {
-				op := float64(len(assignStmt.Rhs)) / float64(len(assignStmt.Lhs))
-				idx = int(math.Floor(op))
-			}
-
-			rhs := assignStmt.Rhs[idx]
-			lit, ok := rhs.(*dst.BasicLit)
-			if !ok {
-				continue
-			}
-
-			scopedName := fmt.Sprintf("%s_%s", parentFunc, ident.Name)
-			vars[scopedName] = lit.Value
-		}
-
 		return true
-	}, nil)
+	}, func(c *dstutil.Cursor) bool {
+		switch c.Node().(type) {
+		case *dst.FuncDecl, *dst.BlockStmt:
+			current = current.parent
+		}
+		return true
+	})
+	return global
+}
 
-	return vars
+func handleAssignment(assignStmt *dst.AssignStmt, scope *Scope) {
+	for idx, lhs := range assignStmt.Lhs {
+		ident, ok := lhs.(*dst.Ident)
+		if !ok {
+			continue
+		}
+		var rhs dst.Expr
+		if len(assignStmt.Lhs) != len(assignStmt.Rhs) {
+			op := float64(len(assignStmt.Rhs)) / float64(len(assignStmt.Lhs))
+			idx = int(math.Floor(op))
+		}
+
+		if len(assignStmt.Rhs) == 1 && len(assignStmt.Lhs) > 1 {
+			rhs = assignStmt.Rhs[0]
+		} else {
+			rhs = assignStmt.Rhs[idx]
+		}
+		lit, ok := rhs.(*dst.BasicLit)
+		if !ok {
+			continue
+		}
+		scope.vars[ident.Name] = lit.Value
+	}
 }
