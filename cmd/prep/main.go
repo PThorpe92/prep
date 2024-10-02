@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"go/build"
 	"go/token"
-	"math"
 	"strings"
 
 	"github.com/dave/dst"
@@ -171,8 +170,9 @@ func collectFuncs(f *dst.File, res *decorator.Restorer) map[string]string {
 }
 
 type Scope struct {
-	parent *Scope
-	vars   map[string]string
+	parent   *Scope
+	children []*Scope
+	vars     map[string]string
 }
 
 func collectVars(f *dst.File) *Scope {
@@ -182,21 +182,71 @@ func collectVars(f *dst.File) *Scope {
 	dstutil.Apply(f, func(c *dstutil.Cursor) bool {
 		switch node := c.Node().(type) {
 		case *dst.FuncDecl:
-			current = &Scope{parent: current, vars: make(map[string]string)}
+			funcScope := &Scope{parent: current, vars: make(map[string]string)}
+			current.children = append(current.children, funcScope)
+			current = funcScope
 		case *dst.BlockStmt:
-			current = &Scope{parent: current, vars: make(map[string]string)}
+			if _, isFuncBody := c.Parent().(*dst.FuncDecl); isFuncBody {
+				// Do not create a new scope for the function body block
+			} else {
+				blockScope := &Scope{parent: current, vars: make(map[string]string)}
+				current.children = append(current.children, blockScope)
+				current = blockScope
+			}
+		case *dst.DeclStmt:
+			if genDecl, ok := node.Decl.(*dst.GenDecl); ok {
+				if genDecl.Tok == token.VAR || genDecl.Tok == token.CONST {
+					handleGenDecl(genDecl, current)
+				}
+			}
+		case *dst.GenDecl:
+			if node.Tok == token.VAR || node.Tok == token.CONST {
+				handleGenDecl(node, current)
+			}
 		case *dst.AssignStmt:
 			handleAssignment(node, current)
 		}
 		return true
 	}, func(c *dstutil.Cursor) bool {
 		switch c.Node().(type) {
-		case *dst.FuncDecl, *dst.BlockStmt:
+		case *dst.FuncDecl:
 			current = current.parent
+		case *dst.BlockStmt:
+			if _, isFuncBody := c.Parent().(*dst.FuncDecl); isFuncBody {
+				// didn't push, so don't pop
+			} else {
+				current = current.parent
+			}
 		}
 		return true
 	})
 	return global
+}
+
+func handleGenDecl(genDecl *dst.GenDecl, scope *Scope) {
+	for _, spec := range genDecl.Specs {
+		valueSpec, ok := spec.(*dst.ValueSpec)
+		if !ok {
+			continue
+		}
+		for idx, name := range valueSpec.Names {
+			if name.Name == "_" {
+				continue
+			}
+			var val string
+			if len(valueSpec.Values) > idx {
+				switch expr := valueSpec.Values[idx].(type) {
+				case *dst.BasicLit:
+					val = expr.Value
+				case *dst.Ident:
+					if identVal, ok := lookupVariable(expr.Name, scope); ok {
+						val = identVal
+					}
+				}
+			}
+			scope.vars[name.Name] = val
+		}
+	}
 }
 
 func handleAssignment(assignStmt *dst.AssignStmt, scope *Scope) {
@@ -206,20 +256,27 @@ func handleAssignment(assignStmt *dst.AssignStmt, scope *Scope) {
 			continue
 		}
 		var rhs dst.Expr
-		if len(assignStmt.Lhs) != len(assignStmt.Rhs) {
-			op := float64(len(assignStmt.Rhs)) / float64(len(assignStmt.Lhs))
-			idx = int(math.Floor(op))
-		}
-
 		if len(assignStmt.Rhs) == 1 && len(assignStmt.Lhs) > 1 {
 			rhs = assignStmt.Rhs[0]
 		} else {
+			if idx >= len(assignStmt.Rhs) {
+				continue
+			}
 			rhs = assignStmt.Rhs[idx]
 		}
-		lit, ok := rhs.(*dst.BasicLit)
-		if !ok {
-			continue
+		switch expr := rhs.(type) {
+		case *dst.BasicLit:
+			if assignStmt.Tok == token.DEFINE {
+				scope.vars[ident.Name] = expr.Value
+			} else if assignStmt.Tok == token.ASSIGN {
+				if _, found := lookupVariable(ident.Name, scope); found {
+					scope.vars[ident.Name] = expr.Value
+				}
+			}
+		case *dst.Ident:
+			if val, found := lookupVariable(expr.Name, scope); found {
+				scope.vars[ident.Name] = val
+			}
 		}
-		scope.vars[ident.Name] = lit.Value
 	}
 }
